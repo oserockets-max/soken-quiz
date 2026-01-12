@@ -1,5 +1,5 @@
 # ==========================================
-# 創研無限問題作成機 (完成・最強エラー回避版)
+# 創研無限問題作成機 (完成・ド根性リトライ版)
 # ==========================================
 import streamlit as st
 import google.generativeai as genai
@@ -11,6 +11,7 @@ import json
 import re
 import time
 import tempfile
+import random
 
 # --- 設定と認証 ---
 st.set_page_config(page_title="創研無限問題作成機", page_icon="🎓", layout="wide")
@@ -37,7 +38,7 @@ def get_drive_service():
         st.error(f"Google Drive接続エラー: {e}")
         return None
 
-# --- デザイン & アニメーション ---
+# --- デザイン ---
 def apply_rich_css():
     st.markdown("""
     <style>
@@ -59,25 +60,12 @@ def apply_rich_css():
     .feedback-correct { background-color: #d4edda; border-left: 5px solid #28a745; color: #155724; }
     .feedback-wrong { background-color: #f8d7da; border-left: 5px solid #dc3545; color: #721c24; }
     
-    /* 派手な表彰アニメーション */
-    @keyframes popIn {
-        0% { transform: scale(0); opacity: 0; }
-        60% { transform: scale(1.1); opacity: 1; }
-        100% { transform: scale(1); }
-    }
+    @keyframes popIn { 0% { transform: scale(0); opacity: 0; } 60% { transform: scale(1.1); opacity: 1; } 100% { transform: scale(1); } }
     .celebration-banner {
         background: linear-gradient(90deg, #FFD700, #FFA500, #FFD700);
-        color: #fff;
-        padding: 20px;
-        border-radius: 15px;
-        text-align: center;
-        font-size: 2em;
-        font-weight: bold;
-        text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
-        margin: 20px 0;
-        animation: popIn 0.8s cubic-bezier(0.68, -0.55, 0.27, 1.55);
-        box-shadow: 0 0 20px rgba(255, 215, 0, 0.6);
-        border: 3px solid #fff;
+        color: #fff; padding: 20px; border-radius: 15px; text-align: center; font-size: 2em; font-weight: bold;
+        text-shadow: 2px 2px 4px rgba(0,0,0,0.3); margin: 20px 0; animation: popIn 0.8s cubic-bezier(0.68, -0.55, 0.27, 1.55);
+        box-shadow: 0 0 20px rgba(255, 215, 0, 0.6); border: 3px solid #fff;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -117,18 +105,13 @@ def wait_for_files_active(files):
             if file.state.name != "ACTIVE":
                 raise Exception(f"File {file.name} failed to process")
 
-# --- 生成ロジック（ここを強化しました！） ---
-def generate_with_fallback(contents):
+# --- 🔥 ド根性生成ロジック ---
+def generate_with_persistence(contents):
     """
-    FlashがだめならPro、それもだめならGemini1.0...と粘り強く試す関数
+    エラーが出ても諦めずに待機して再試行する関数
     """
-    # 試すモデルの順番
-    models_to_try = [
-        "models/gemini-1.5-flash",
-        "models/gemini-1.5-pro",
-        "models/gemini-pro"
-    ]
-    
+    # 試すモデル（Flashが一番速いので最優先）
+    models = ["models/gemini-1.5-flash", "models/gemini-1.5-pro", "models/gemini-pro"]
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -136,23 +119,31 @@ def generate_with_fallback(contents):
         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
     ]
 
-    for model_name in models_to_try:
-        try:
-            model = genai.GenerativeModel(
-                model_name=model_name,
-                generation_config={"response_mime_type": "application/json"},
-                safety_settings=safety_settings
-            )
-            response = model.generate_content(contents)
-            return response # 成功したら即座に返す
-        except Exception as e:
-            # 失敗したらログに出して次のモデルへ
-            print(f"Model {model_name} failed: {e}")
-            time.sleep(1) # 少し休んでから次へ
-            continue
+    max_retries = 6  # 最大6回トライ（約1分粘る）
     
-    # 全部失敗した場合
-    st.error("全てのAIモデルが応答しませんでした。少し時間を置いてから再試行してください。")
+    for attempt in range(max_retries):
+        for model_name in models:
+            try:
+                # 試行状況を表示（ユーザーに安心感を与える）
+                if attempt > 0:
+                    st.toast(f"AIが混雑中... 再接続しています (回数: {attempt+1}/{max_retries}) ⏳")
+                
+                model = genai.GenerativeModel(
+                    model_name=model_name,
+                    generation_config={"response_mime_type": "application/json"},
+                    safety_settings=safety_settings
+                )
+                response = model.generate_content(contents)
+                return response # 成功したら即終了
+                
+            except Exception as e:
+                # エラーが出たら少し待つ（回数が増えるごとに待ち時間を長くする）
+                wait_time = 5 + (attempt * 3) # 5秒, 8秒, 11秒...
+                print(f"Retry {attempt} with {model_name} failed. Waiting {wait_time}s.")
+                time.sleep(wait_time)
+                continue # 次のモデル/次の回数へ
+
+    st.error("申し訳ありません。AIが非常に混雑しており、接続できませんでした。")
     return None
 
 def extract_json_robust(text):
@@ -179,16 +170,16 @@ def generate_quiz_batch(gemini_file, mode, history_list):
     [ {{ "type": "choice/text", "question": "...", "options": [...], "answer": "...", "explanation": "..." }} ]
     """
     
-    # 強化版の生成関数を呼ぶ
-    res = generate_with_fallback([gemini_file, prompt])
+    # ド根性関数を呼び出す
+    res = generate_with_persistence([gemini_file, prompt])
     
     if res:
         data = extract_json_robust(res.text)
         if isinstance(data, list) and data: return data
     
-    # リトライ（1問だけ）
+    # 失敗したら1問だけで再トライ
     prompt_single = f"クイズを1問作成。条件:{inst} {avoid} JSON出力。"
-    res_s = generate_with_fallback([gemini_file, prompt_single])
+    res_s = generate_with_persistence([gemini_file, prompt_single])
     if res_s:
         d = extract_json_robust(res_s.text)
         if isinstance(d, dict): return [d]
@@ -199,7 +190,7 @@ def grade_answer_flexible(q, a, user_in):
     採点。問題:{q} 模範:{a} 回答:{user_in}
     〇/△/×で評価。JSON:{{ "result": "...", "score_percent": 0, "feedback": "..." }}
     """
-    res = generate_with_fallback(prompt) # ここも強化版を使用
+    res = generate_with_persistence(prompt)
     if res:
         data = extract_json_robust(res.text)
         if "result" in data: return data
@@ -210,7 +201,6 @@ def grade_answer_flexible(q, a, user_in):
 # ==========================================
 def main():
     apply_rich_css()
-    # セッション初期化
     if 'queue' not in st.session_state: st.session_state.queue = []
     if 'current' not in st.session_state: st.session_state.current = None
     if 'score' not in st.session_state: st.session_state.score = 0
@@ -229,20 +219,14 @@ def main():
     drive_service = get_drive_service()
     if not drive_service: return
 
-    # --- サイドバー (スコア・正答率・連勝) ---
     with st.sidebar:
         st.header("📊 成績ボード")
-        
         st.metric("現在のスコア", f"{st.session_state.score} / {st.session_state.total}")
-        
         if st.session_state.total > 0:
             accuracy = (st.session_state.score / st.session_state.total) * 100
-        else:
-            accuracy = 0.0
+        else: accuracy = 0.0
         st.metric("正答率", f"{accuracy:.1f}%")
-
         st.metric("連続正解", f"{st.session_state.streak} 連勝中🔥")
-
         st.markdown("---")
         st.header("📚 ライブラリ")
         if st.button("🔄 リスト更新"): st.rerun()
@@ -271,21 +255,16 @@ def main():
             st.session_state.queue = []
             st.session_state.last_mode = mode
 
-    # メインロジック
     if st.session_state.active_gemini_file:
-        # 問題補充
         if not st.session_state.queue and not st.session_state.current:
-            with st.spinner("⚡ 問題を作成中... (AI思考中)"):
+            with st.spinner("⚡ 問題を作成中... (AIが混雑時は自動待機します)"):
                 new_q = generate_quiz_batch(st.session_state.active_gemini_file, mode, st.session_state.history)
                 if new_q:
                     st.session_state.queue.extend(new_q)
                     for q in new_q: st.session_state.history.append(q['question'])
                     st.rerun()
-                else:
-                    # ここでエラーが出ても止まらないように、メッセージを優しくする
-                    st.warning("⚠️ AIが少し疲れているようです。もう一度リロードするか、少し待ってから試してみてください。")
+                # ここでエラー表示はあえて出さず、spinnerが回り続けることで待機を表現
 
-        # 次の問題へ
         if not st.session_state.current and st.session_state.queue:
             st.session_state.current = st.session_state.queue.pop(0)
             st.session_state.answered = False
@@ -294,12 +273,10 @@ def main():
             st.session_state.balloons_shown = False
             st.rerun()
 
-        # 問題表示
         if st.session_state.current:
             q = st.session_state.current
             st.markdown(f'<div class="question-box">Q. {q["question"]}</div>', unsafe_allow_html=True)
             
-            # --- 回答処理 ---
             if q['type'] == 'choice':
                 with st.form("choice"):
                     sel = st.radio("選択", q.get('options', []) or ["(選択肢エラー)"])
@@ -330,20 +307,14 @@ def main():
                                 st.session_state.streak = 0
                             st.rerun()
             
-            # --- 結果表示 & お祝い演出 ---
             if st.session_state.answered and st.session_state.result_data:
                 res = st.session_state.result_data
                 cls = "correct" if res['result']=="〇" else "wrong"
                 
-                # ★ 派手な表彰ロジック (5の倍数の連勝時)
                 current_streak = st.session_state.streak
                 if res['result'] == "〇" and current_streak > 0 and current_streak % 5 == 0:
                     if not st.session_state.balloons_shown:
-                        st.markdown(f"""
-                        <div class="celebration-banner">
-                        🎉 おめでとう！ {current_streak} 問連続正解！ 🏆
-                        </div>
-                        """, unsafe_allow_html=True)
+                        st.markdown(f"""<div class="celebration-banner">🎉 おめでとう！ {current_streak} 問連続正解！ 🏆</div>""", unsafe_allow_html=True)
                         st.balloons()
                         st.session_state.balloons_shown = True
                 
