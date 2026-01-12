@@ -1,5 +1,5 @@
 # ==========================================
-# 創研無限問題作成機 (完成・エラー表示強化版)
+# 創研無限問題作成機 (完成・自動モデル選択版)
 # ==========================================
 import streamlit as st
 import google.generativeai as genai
@@ -27,6 +27,33 @@ except:
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 FOLDER_ID = "1KULNeMIXdpxhvrhcixZgXig6RZMsusxC" # あなたのID
 
+# --- モデル自動選択機能 (New!) ---
+def get_best_model():
+    """使用可能なモデルを自動で探す"""
+    try:
+        # 使えるモデル一覧を取得
+        models = list(genai.list_models())
+        # 'generateContent' が使えるモデルだけに絞る
+        available = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
+        
+        # 優先順位: Flash -> Pro -> その他
+        for m in available:
+            if "flash" in m.lower() and "1.5" in m: return m
+        for m in available:
+            if "pro" in m.lower() and "1.5" in m: return m
+        for m in available:
+            if "gemini" in m.lower(): return m
+            
+        return "models/gemini-pro" # 最終手段
+    except Exception as e:
+        st.warning(f"モデル探索エラー: {e}")
+        return "gemini-1.5-flash"
+
+# 起動時に一度だけモデルを決める
+if 'use_model' not in st.session_state:
+    st.session_state.use_model = get_best_model()
+
+# --- Drive接続 ---
 def get_drive_service():
     try:
         key_dict = dict(st.secrets["gcp_service_account"])
@@ -98,9 +125,8 @@ def wait_for_files_active(files):
             if file.state.name != "ACTIVE":
                 raise Exception(f"File {file.name} failed to process")
 
-# --- 生成ロジック（改良版） ---
+# --- 生成ロジック ---
 def generate_with_retry(model_name, contents):
-    # 安全設定を「ブロックなし」にする（重要）
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -115,7 +141,6 @@ def generate_with_retry(model_name, contents):
     try:
         return model.generate_content(contents)
     except Exception as e:
-        # エラーを画面に出す
         st.error(f"AI生成エラー: {e}")
         return None
 
@@ -147,7 +172,6 @@ def generate_quiz_batch(model_name, gemini_file, mode, history_list):
         data = extract_json_robust(res.text)
         if isinstance(data, list) and data: return data
     
-    # 失敗時は1問作成でリトライ
     prompt_single = f"クイズを1問作成。条件:{inst} {avoid} JSON出力。"
     res_s = generate_with_retry(model_name, [gemini_file, prompt_single])
     if res_s:
@@ -192,6 +216,9 @@ def main():
     # サイドバー
     with st.sidebar:
         st.header("📚 ライブラリ")
+        # モデル確認用表示
+        st.caption(f"AI Model: {st.session_state.use_model}")
+        
         if st.button("🔄 リスト更新"): st.rerun()
 
         files = list_pdf_files(drive_service, FOLDER_ID)
@@ -201,7 +228,6 @@ def main():
         
         if selected != "(選択してください)":
             file_id = file_map[selected]
-            # 新しいファイルを選んだ時だけ読み込む
             if 'current_file_id' not in st.session_state or st.session_state.current_file_id != file_id:
                 with st.spinner("クラウドから資料を読み込んでいます..."):
                     pdf_data = download_file_from_drive(drive_service, file_id)
@@ -224,7 +250,8 @@ def main():
     if st.session_state.active_gemini_file:
         if not st.session_state.queue and not st.session_state.current:
             with st.spinner("⚡ 問題を作成中..."):
-                new_q = generate_quiz_batch("models/gemini-1.5-flash", st.session_state.active_gemini_file, mode, st.session_state.history)
+                # ここで自動選択されたモデルを使用
+                new_q = generate_quiz_batch(st.session_state.use_model, st.session_state.active_gemini_file, mode, st.session_state.history)
                 if new_q:
                     st.session_state.queue.extend(new_q)
                     for q in new_q: st.session_state.history.append(q['question'])
@@ -260,7 +287,8 @@ def main():
                     txt = st.text_area("記述回答", key=f"txt_{st.session_state.input_key}")
                     if st.form_submit_button("採点"):
                         with st.spinner("採点中..."):
-                            res = grade_answer_flexible("models/gemini-1.5-flash", q['question'], q['answer'], txt)
+                            # 採点にも自動選択モデルを使用
+                            res = grade_answer_flexible(st.session_state.use_model, q['question'], q['answer'], txt)
                             st.session_state.result_data = res
                             st.session_state.answered = True
                             st.session_state.total += 1
