@@ -1,5 +1,5 @@
 # ==========================================
-# 創研無限問題作成機 (完成版・読取専用モード)
+# 創研無限問題作成機 (完成・エラー表示強化版)
 # ==========================================
 import streamlit as st
 import google.generativeai as genai
@@ -15,7 +15,7 @@ import tempfile
 # --- 設定と認証 ---
 st.set_page_config(page_title="創研無限問題作成機", page_icon="🎓", layout="wide")
 
-# 1. APIキーの取得
+# 1. APIキー
 try:
     api_key = st.secrets["GOOGLE_API_KEY"]
     genai.configure(api_key=api_key)
@@ -23,9 +23,9 @@ except:
     st.error("Secretsに GOOGLE_API_KEY が設定されていません。")
     st.stop()
 
-# 2. Google Drive APIの認証
-SCOPES = ['https://www.googleapis.com/auth/drive.readonly'] # 読み取り専用に変更
-FOLDER_ID = "1KULNeMIXdpxhvrhcixZgXig6RZMsusxC" # あなたのフォルダID
+# 2. Google Drive API
+SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+FOLDER_ID = "1KULNeMIXdpxhvrhcixZgXig6RZMsusxC" # あなたのID
 
 def get_drive_service():
     try:
@@ -53,44 +53,23 @@ def apply_rich_css():
         padding: 10px;
         margin-bottom: 20px;
     }
-    .question-box {
-        background: #ffffff;
-        padding: 30px;
-        margin: 20px 0;
-        font-size: 1.3em;
-        font-weight: bold;
-        color: #333;
-        border-radius: 12px;
-        border-left: 8px solid #6a11cb;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.05);
-    }
-    .feedback-box {
-        padding: 20px; border-radius: 12px; margin-top: 15px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.05); animation: fadeIn 0.5s;
-    }
+    .question-box { background: #ffffff; padding: 30px; margin: 20px 0; font-size: 1.3em; font-weight: bold; border-radius: 12px; border-left: 8px solid #6a11cb; box-shadow: 0 4px 15px rgba(0,0,0,0.05); color: #333; }
+    .feedback-box { padding: 20px; border-radius: 12px; margin-top: 15px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); animation: fadeIn 0.5s; }
     .feedback-correct { background-color: #d4edda; border-left: 5px solid #28a745; color: #155724; }
     .feedback-wrong { background-color: #f8d7da; border-left: 5px solid #dc3545; color: #721c24; }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
-    
-    /* 使い方ガイドの装飾 */
-    .usage-guide {
-        background-color: #e8f0fe;
-        border: 1px solid #4285f4;
-        border-radius: 8px;
-        padding: 15px;
-        color: #174ea6;
-        font-size: 0.9em;
-        margin-bottom: 20px;
-    }
     </style>
     """, unsafe_allow_html=True)
 
-# --- Drive操作関数 ---
+# --- 基本機能 ---
 def list_pdf_files(service, folder_id):
-    # 名前順にソートして取得
-    query = f"'{folder_id}' in parents and mimeType = 'application/pdf' and trashed = false"
-    results = service.files().list(q=query, fields="files(id, name)", orderBy="name").execute()
-    return results.get('files', [])
+    try:
+        query = f"'{folder_id}' in parents and mimeType = 'application/pdf' and trashed = false"
+        results = service.files().list(q=query, fields="files(id, name)", orderBy="name").execute()
+        return results.get('files', [])
+    except Exception as e:
+        st.error(f"フォルダ読み込みエラー: {e}")
+        return []
 
 def download_file_from_drive(service, file_id):
     request = service.files().get_media(fileId=file_id)
@@ -102,7 +81,6 @@ def download_file_from_drive(service, file_id):
     fh.seek(0)
     return fh
 
-# --- Gemini関連関数 ---
 def upload_to_gemini(file_obj, mime_type="application/pdf"):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(file_obj.getvalue() if hasattr(file_obj, 'getvalue') else file_obj.read())
@@ -120,11 +98,25 @@ def wait_for_files_active(files):
             if file.state.name != "ACTIVE":
                 raise Exception(f"File {file.name} failed to process")
 
+# --- 生成ロジック（改良版） ---
 def generate_with_retry(model_name, contents):
-    model = genai.GenerativeModel(model_name, generation_config={"response_mime_type": "application/json"})
+    # 安全設定を「ブロックなし」にする（重要）
+    safety_settings = [
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+    ]
+    model = genai.GenerativeModel(
+        model_name=model_name,
+        generation_config={"response_mime_type": "application/json"},
+        safety_settings=safety_settings
+    )
     try:
         return model.generate_content(contents)
-    except:
+    except Exception as e:
+        # エラーを画面に出す
+        st.error(f"AI生成エラー: {e}")
         return None
 
 def extract_json_robust(text):
@@ -147,7 +139,7 @@ def generate_quiz_batch(model_name, gemini_file, mode, history_list):
     この資料から学習用クイズを【{count}問】作成。
     条件: {inst}
     {avoid}
-    JSON出力リスト形式:
+    出力形式(JSONリスト):
     [ {{ "type": "choice/text", "question": "...", "options": [...], "answer": "...", "explanation": "..." }} ]
     """
     res = generate_with_retry(model_name, [gemini_file, prompt])
@@ -155,6 +147,7 @@ def generate_quiz_batch(model_name, gemini_file, mode, history_list):
         data = extract_json_robust(res.text)
         if isinstance(data, list) and data: return data
     
+    # 失敗時は1問作成でリトライ
     prompt_single = f"クイズを1問作成。条件:{inst} {avoid} JSON出力。"
     res_s = generate_with_retry(model_name, [gemini_file, prompt_single])
     if res_s:
@@ -164,9 +157,8 @@ def generate_quiz_batch(model_name, gemini_file, mode, history_list):
 
 def grade_answer_flexible(model_name, q, a, user_in):
     prompt = f"""
-    採点してください。問題:{q} 模範解答:{a} 生徒回答:{user_in}
-    一般知識も考慮し〇/△/×で評価。
-    JSON出力: {{ "result": "〇/△/×", "score_percent": 数値, "feedback": "コメント" }}
+    採点。問題:{q} 模範:{a} 回答:{user_in}
+    〇/△/×で評価。JSON:{{ "result": "...", "score_percent": 0, "feedback": "..." }}
     """
     res = generate_with_retry(model_name, prompt)
     if res:
@@ -200,43 +192,26 @@ def main():
     # サイドバー
     with st.sidebar:
         st.header("📚 ライブラリ")
-        
-        # 使い方ガイド
-        st.markdown("""
-        <div class="usage-guide">
-        <b>💡 資料の追加方法</b><br>
-        1. Googleドライブを開く<br>
-        2. <b>Soken_Quiz_Data</b> フォルダを開く<br>
-        3. PDFをそこに保存するだけ！<br>
-        4. 下のボタンでリストを更新
-        </div>
-        """, unsafe_allow_html=True)
+        if st.button("🔄 リスト更新"): st.rerun()
 
-        if st.button("🔄 ライブラリを更新"):
-            st.rerun()
-
-        # ファイル一覧取得
         files = list_pdf_files(drive_service, FOLDER_ID)
+        file_map = {f['name']: f['id'] for f in files}
+        options = ["(選択してください)"] + list(file_map.keys())
+        selected = st.selectbox("学習する資料を選択", options)
         
-        if not files:
-            st.warning("📁 フォルダにPDFが見つかりません。")
-        else:
-            file_map = {f['name']: f['id'] for f in files}
-            options = ["(選択してください)"] + list(file_map.keys())
-            selected = st.selectbox("学習する資料を選択", options)
-            
-            if selected != "(選択してください)":
-                file_id = file_map[selected]
-                if 'current_file_id' not in st.session_state or st.session_state.current_file_id != file_id:
-                    with st.spinner("クラウドから資料を読み込んでいます..."):
-                        pdf_data = download_file_from_drive(drive_service, file_id)
-                        gemini_file = upload_to_gemini(pdf_data)
-                        wait_for_files_active([gemini_file])
-                        st.session_state.active_gemini_file = gemini_file
-                        st.session_state.current_file_id = file_id
-                        st.session_state.queue = [] 
-                        st.session_state.history = []
-                        st.success(f"『{selected}』を読み込みました！")
+        if selected != "(選択してください)":
+            file_id = file_map[selected]
+            # 新しいファイルを選んだ時だけ読み込む
+            if 'current_file_id' not in st.session_state or st.session_state.current_file_id != file_id:
+                with st.spinner("クラウドから資料を読み込んでいます..."):
+                    pdf_data = download_file_from_drive(drive_service, file_id)
+                    gemini_file = upload_to_gemini(pdf_data)
+                    wait_for_files_active([gemini_file])
+                    st.session_state.active_gemini_file = gemini_file
+                    st.session_state.current_file_id = file_id
+                    st.session_state.queue = [] 
+                    st.session_state.history = []
+                    st.success(f"『{selected}』を読み込みました！")
 
         st.markdown("---")
         mode = st.radio("出題モード", ["記述問題", "4択問題", "おまかせ (Mix)"])
@@ -255,7 +230,7 @@ def main():
                     for q in new_q: st.session_state.history.append(q['question'])
                     st.rerun()
                 else:
-                    st.error("作成失敗。")
+                    st.error("作成失敗。もう一度試すか、PDFが画像スキャンでないか確認してください。")
 
         if not st.session_state.current and st.session_state.queue:
             st.session_state.current = st.session_state.queue.pop(0)
@@ -270,7 +245,7 @@ def main():
             st.markdown(f'<div class="question-box">Q. {q["question"]}</div>', unsafe_allow_html=True)
             if q['type'] == 'choice':
                 with st.form("choice"):
-                    sel = st.radio("選択", q.get('options', []))
+                    sel = st.radio("選択", q.get('options', []) or ["(選択肢エラー)"])
                     if st.form_submit_button("回答"):
                         st.session_state.answered = True
                         st.session_state.total += 1
@@ -312,7 +287,7 @@ def main():
                         st.session_state.result_data = None
                         st.rerun()
     else:
-        st.info("👈 左のサイドバーから学習したい資料を選んでください。")
+        st.info("👈 左から資料を選択してください")
 
 if __name__ == "__main__":
     main()
