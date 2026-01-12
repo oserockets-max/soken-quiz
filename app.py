@@ -1,5 +1,5 @@
 # ==========================================
-# 創研無限問題作成機 (完成・自動モデル選択版)
+# 創研無限問題作成機 (完成・正答率＆連勝演出強化版)
 # ==========================================
 import streamlit as st
 import google.generativeai as genai
@@ -27,29 +27,19 @@ except:
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 FOLDER_ID = "1KULNeMIXdpxhvrhcixZgXig6RZMsusxC" # あなたのID
 
-# --- モデル自動選択機能 (New!) ---
+# --- モデル自動選択 ---
 def get_best_model():
-    """使用可能なモデルを自動で探す"""
     try:
-        # 使えるモデル一覧を取得
         models = list(genai.list_models())
-        # 'generateContent' が使えるモデルだけに絞る
         available = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
-        
-        # 優先順位: Flash -> Pro -> その他
         for m in available:
             if "flash" in m.lower() and "1.5" in m: return m
         for m in available:
             if "pro" in m.lower() and "1.5" in m: return m
-        for m in available:
-            if "gemini" in m.lower(): return m
-            
-        return "models/gemini-pro" # 最終手段
-    except Exception as e:
-        st.warning(f"モデル探索エラー: {e}")
+        return "models/gemini-pro"
+    except:
         return "gemini-1.5-flash"
 
-# 起動時に一度だけモデルを決める
 if 'use_model' not in st.session_state:
     st.session_state.use_model = get_best_model()
 
@@ -63,7 +53,7 @@ def get_drive_service():
         st.error(f"Google Drive接続エラー: {e}")
         return None
 
-# --- デザイン ---
+# --- デザイン & アニメーション ---
 def apply_rich_css():
     st.markdown("""
     <style>
@@ -84,6 +74,28 @@ def apply_rich_css():
     .feedback-box { padding: 20px; border-radius: 12px; margin-top: 15px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); animation: fadeIn 0.5s; }
     .feedback-correct { background-color: #d4edda; border-left: 5px solid #28a745; color: #155724; }
     .feedback-wrong { background-color: #f8d7da; border-left: 5px solid #dc3545; color: #721c24; }
+    
+    /* 派手な表彰アニメーション */
+    @keyframes popIn {
+        0% { transform: scale(0); opacity: 0; }
+        60% { transform: scale(1.1); opacity: 1; }
+        100% { transform: scale(1); }
+    }
+    .celebration-banner {
+        background: linear-gradient(90deg, #FFD700, #FFA500, #FFD700);
+        color: #fff;
+        padding: 20px;
+        border-radius: 15px;
+        text-align: center;
+        font-size: 2em;
+        font-weight: bold;
+        text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        margin: 20px 0;
+        animation: popIn 0.8s cubic-bezier(0.68, -0.55, 0.27, 1.55);
+        box-shadow: 0 0 20px rgba(255, 215, 0, 0.6);
+        border: 3px solid #fff;
+    }
+    
     @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
     </style>
     """, unsafe_allow_html=True)
@@ -94,9 +106,7 @@ def list_pdf_files(service, folder_id):
         query = f"'{folder_id}' in parents and mimeType = 'application/pdf' and trashed = false"
         results = service.files().list(q=query, fields="files(id, name)", orderBy="name").execute()
         return results.get('files', [])
-    except Exception as e:
-        st.error(f"フォルダ読み込みエラー: {e}")
-        return []
+    except: return []
 
 def download_file_from_drive(service, file_id):
     request = service.files().get_media(fileId=file_id)
@@ -133,16 +143,9 @@ def generate_with_retry(model_name, contents):
         {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
     ]
-    model = genai.GenerativeModel(
-        model_name=model_name,
-        generation_config={"response_mime_type": "application/json"},
-        safety_settings=safety_settings
-    )
-    try:
-        return model.generate_content(contents)
-    except Exception as e:
-        st.error(f"AI生成エラー: {e}")
-        return None
+    model = genai.GenerativeModel(model_name=model_name, generation_config={"response_mime_type": "application/json"}, safety_settings=safety_settings)
+    try: return model.generate_content(contents)
+    except: return None
 
 def extract_json_robust(text):
     try: return json.loads(text)
@@ -195,11 +198,12 @@ def grade_answer_flexible(model_name, q, a, user_in):
 # ==========================================
 def main():
     apply_rich_css()
+    # セッション初期化
     if 'queue' not in st.session_state: st.session_state.queue = []
     if 'current' not in st.session_state: st.session_state.current = None
     if 'score' not in st.session_state: st.session_state.score = 0
     if 'total' not in st.session_state: st.session_state.total = 0
-    if 'streak' not in st.session_state: st.session_state.streak = 0
+    if 'streak' not in st.session_state: st.session_state.streak = 0 # 連続正解数
     if 'answered' not in st.session_state: st.session_state.answered = False
     if 'result_data' not in st.session_state: st.session_state.result_data = None
     if 'history' not in st.session_state: st.session_state.history = []
@@ -213,12 +217,25 @@ def main():
     drive_service = get_drive_service()
     if not drive_service: return
 
-    # サイドバー
+    # --- サイドバー (スコア・正答率・連勝) ---
     with st.sidebar:
-        st.header("📚 ライブラリ")
-        # モデル確認用表示
-        st.caption(f"AI Model: {st.session_state.use_model}")
+        st.header("📊 成績ボード")
         
+        # 1. スコア表示
+        st.metric("現在のスコア", f"{st.session_state.score} / {st.session_state.total}")
+        
+        # 2. 正答率計算
+        if st.session_state.total > 0:
+            accuracy = (st.session_state.score / st.session_state.total) * 100
+        else:
+            accuracy = 0.0
+        st.metric("正答率", f"{accuracy:.1f}%")
+
+        # 3. 連続正解数 (連勝)
+        st.metric("連続正解", f"{st.session_state.streak} 連勝中🔥")
+
+        st.markdown("---")
+        st.header("📚 ライブラリ")
         if st.button("🔄 リスト更新"): st.rerun()
 
         files = list_pdf_files(drive_service, FOLDER_ID)
@@ -237,6 +254,7 @@ def main():
                     st.session_state.current_file_id = file_id
                     st.session_state.queue = [] 
                     st.session_state.history = []
+                    # ファイル変更時に連勝などはリセットしない（継続して学習できるよう）
                     st.success(f"『{selected}』を読み込みました！")
 
         st.markdown("---")
@@ -244,21 +262,21 @@ def main():
         if mode != st.session_state.last_mode:
             st.session_state.queue = []
             st.session_state.last_mode = mode
-        st.metric("スコア", f"{st.session_state.score} / {st.session_state.total}")
 
     # メインロジック
     if st.session_state.active_gemini_file:
+        # 問題補充
         if not st.session_state.queue and not st.session_state.current:
             with st.spinner("⚡ 問題を作成中..."):
-                # ここで自動選択されたモデルを使用
                 new_q = generate_quiz_batch(st.session_state.use_model, st.session_state.active_gemini_file, mode, st.session_state.history)
                 if new_q:
                     st.session_state.queue.extend(new_q)
                     for q in new_q: st.session_state.history.append(q['question'])
                     st.rerun()
                 else:
-                    st.error("作成失敗。もう一度試すか、PDFが画像スキャンでないか確認してください。")
+                    st.error("作成失敗。もう一度試してください。")
 
+        # 次の問題へ
         if not st.session_state.current and st.session_state.queue:
             st.session_state.current = st.session_state.queue.pop(0)
             st.session_state.answered = False
@@ -267,19 +285,24 @@ def main():
             st.session_state.balloons_shown = False
             st.rerun()
 
+        # 問題表示
         if st.session_state.current:
             q = st.session_state.current
             st.markdown(f'<div class="question-box">Q. {q["question"]}</div>', unsafe_allow_html=True)
+            
+            # --- 回答処理 ---
             if q['type'] == 'choice':
                 with st.form("choice"):
                     sel = st.radio("選択", q.get('options', []) or ["(選択肢エラー)"])
                     if st.form_submit_button("回答"):
                         st.session_state.answered = True
                         st.session_state.total += 1
-                        if sel == q['answer']:
+                        if sel == q.get('answer', ''):
                             st.session_state.score += 1
+                            st.session_state.streak += 1 # 連勝+1
                             st.session_state.result_data = {"result": "〇", "feedback": "正解！"}
                         else:
+                            st.session_state.streak = 0 # 連勝ストップ
                             st.session_state.result_data = {"result": "×", "feedback": "不正解"}
                         st.rerun()
             else:
@@ -287,23 +310,46 @@ def main():
                     txt = st.text_area("記述回答", key=f"txt_{st.session_state.input_key}")
                     if st.form_submit_button("採点"):
                         with st.spinner("採点中..."):
-                            # 採点にも自動選択モデルを使用
-                            res = grade_answer_flexible(st.session_state.use_model, q['question'], q['answer'], txt)
+                            res = grade_answer_flexible(st.session_state.use_model, q['question'], q.get('answer', '模範解答なし'), txt)
                             st.session_state.result_data = res
                             st.session_state.answered = True
                             st.session_state.total += 1
-                            if res['result'] == "〇": st.session_state.score += 1
+                            if res['result'] == "〇": 
+                                st.session_state.score += 1
+                                st.session_state.streak += 1 # 連勝+1
+                            else:
+                                st.session_state.streak = 0 # 連勝ストップ
                             st.rerun()
+            
+            # --- 結果表示 & お祝い演出 ---
             if st.session_state.answered and st.session_state.result_data:
                 res = st.session_state.result_data
                 cls = "correct" if res['result']=="〇" else "wrong"
-                st.markdown(f'<div class="feedback-box feedback-{cls}">判定: {res["result"]} - {res["feedback"]}</div>', unsafe_allow_html=True)
-                if res['result'] == "〇" and not st.session_state.balloons_shown:
-                    st.balloons()
+                
+                # ★ 派手な表彰ロジック (5の倍数の連勝時)
+                current_streak = st.session_state.streak
+                if res['result'] == "〇" and current_streak > 0 and current_streak % 5 == 0:
+                    if not st.session_state.balloons_shown:
+                        st.markdown(f"""
+                        <div class="celebration-banner">
+                        🎉 おめでとう！ {current_streak} 問連続正解！ 🏆
+                        </div>
+                        """, unsafe_allow_html=True)
+                        st.balloons() # 風船を飛ばす
+                        st.session_state.balloons_shown = True
+                
+                # 通常の正解風船（1問ごとのプチお祝い）は、連勝表彰がない時だけ飛ばす（うるさくなりすぎないよう）
+                elif res['result'] == "〇" and not st.session_state.balloons_shown:
+                    # st.balloons() # 毎回飛ばしたい場合はコメントアウトを外す
                     st.session_state.balloons_shown = True
+
+                # 結果ボックス表示
+                st.markdown(f'<div class="feedback-box feedback-{cls}">判定: {res["result"]} - {res["feedback"]}</div>', unsafe_allow_html=True)
+                
                 with st.expander("解説"):
-                    st.write(q['answer'])
-                    st.write(q['explanation'])
+                    st.write(f"**正解:** {q.get('answer', '（データなし）')}")
+                    st.write(f"**解説:** {q.get('explanation', '（AIが解説を作成しませんでした）')}")
+
                 c1, c2 = st.columns(2)
                 if c1.button("次へ"):
                     st.session_state.current = None
@@ -311,6 +357,8 @@ def main():
                     st.rerun()
                 if res['result'] != "〇":
                     if c2.button("やり直す"):
+                        # やり直すときは連勝カウントは戻さない（厳しい仕様）か、戻すか
+                        # ここでは「やり直しても連勝は途切れたまま」にしています
                         st.session_state.answered = False
                         st.session_state.result_data = None
                         st.rerun()
