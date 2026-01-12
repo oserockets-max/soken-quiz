@@ -1,5 +1,5 @@
 # ==========================================
-# 創研無限問題作成機 (完成・正答率＆連勝演出強化版)
+# 創研無限問題作成機 (完成・最強エラー回避版)
 # ==========================================
 import streamlit as st
 import google.generativeai as genai
@@ -26,22 +26,6 @@ except:
 # 2. Google Drive API
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 FOLDER_ID = "1KULNeMIXdpxhvrhcixZgXig6RZMsusxC" # あなたのID
-
-# --- モデル自動選択 ---
-def get_best_model():
-    try:
-        models = list(genai.list_models())
-        available = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
-        for m in available:
-            if "flash" in m.lower() and "1.5" in m: return m
-        for m in available:
-            if "pro" in m.lower() and "1.5" in m: return m
-        return "models/gemini-pro"
-    except:
-        return "gemini-1.5-flash"
-
-if 'use_model' not in st.session_state:
-    st.session_state.use_model = get_best_model()
 
 # --- Drive接続 ---
 def get_drive_service():
@@ -95,8 +79,6 @@ def apply_rich_css():
         box-shadow: 0 0 20px rgba(255, 215, 0, 0.6);
         border: 3px solid #fff;
     }
-    
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
     </style>
     """, unsafe_allow_html=True)
 
@@ -135,17 +117,43 @@ def wait_for_files_active(files):
             if file.state.name != "ACTIVE":
                 raise Exception(f"File {file.name} failed to process")
 
-# --- 生成ロジック ---
-def generate_with_retry(model_name, contents):
+# --- 生成ロジック（ここを強化しました！） ---
+def generate_with_fallback(contents):
+    """
+    FlashがだめならPro、それもだめならGemini1.0...と粘り強く試す関数
+    """
+    # 試すモデルの順番
+    models_to_try = [
+        "models/gemini-1.5-flash",
+        "models/gemini-1.5-pro",
+        "models/gemini-pro"
+    ]
+    
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
     ]
-    model = genai.GenerativeModel(model_name=model_name, generation_config={"response_mime_type": "application/json"}, safety_settings=safety_settings)
-    try: return model.generate_content(contents)
-    except: return None
+
+    for model_name in models_to_try:
+        try:
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config={"response_mime_type": "application/json"},
+                safety_settings=safety_settings
+            )
+            response = model.generate_content(contents)
+            return response # 成功したら即座に返す
+        except Exception as e:
+            # 失敗したらログに出して次のモデルへ
+            print(f"Model {model_name} failed: {e}")
+            time.sleep(1) # 少し休んでから次へ
+            continue
+    
+    # 全部失敗した場合
+    st.error("全てのAIモデルが応答しませんでした。少し時間を置いてから再試行してください。")
+    return None
 
 def extract_json_robust(text):
     try: return json.loads(text)
@@ -159,7 +167,7 @@ def extract_json_robust(text):
         except: pass
     return {}
 
-def generate_quiz_batch(model_name, gemini_file, mode, history_list):
+def generate_quiz_batch(gemini_file, mode, history_list):
     count = 3
     avoid = "【重複禁止】:\\n" + "\\n".join(history_list[-30:]) if history_list else ""
     inst = "全て【記述式(論述)】" if mode == "記述問題" else "全て【4択】" if mode == "4択問題" else "記述と4択Mix"
@@ -170,24 +178,28 @@ def generate_quiz_batch(model_name, gemini_file, mode, history_list):
     出力形式(JSONリスト):
     [ {{ "type": "choice/text", "question": "...", "options": [...], "answer": "...", "explanation": "..." }} ]
     """
-    res = generate_with_retry(model_name, [gemini_file, prompt])
+    
+    # 強化版の生成関数を呼ぶ
+    res = generate_with_fallback([gemini_file, prompt])
+    
     if res:
         data = extract_json_robust(res.text)
         if isinstance(data, list) and data: return data
     
+    # リトライ（1問だけ）
     prompt_single = f"クイズを1問作成。条件:{inst} {avoid} JSON出力。"
-    res_s = generate_with_retry(model_name, [gemini_file, prompt_single])
+    res_s = generate_with_fallback([gemini_file, prompt_single])
     if res_s:
         d = extract_json_robust(res_s.text)
         if isinstance(d, dict): return [d]
     return []
 
-def grade_answer_flexible(model_name, q, a, user_in):
+def grade_answer_flexible(q, a, user_in):
     prompt = f"""
     採点。問題:{q} 模範:{a} 回答:{user_in}
     〇/△/×で評価。JSON:{{ "result": "...", "score_percent": 0, "feedback": "..." }}
     """
-    res = generate_with_retry(model_name, prompt)
+    res = generate_with_fallback(prompt) # ここも強化版を使用
     if res:
         data = extract_json_robust(res.text)
         if "result" in data: return data
@@ -203,7 +215,7 @@ def main():
     if 'current' not in st.session_state: st.session_state.current = None
     if 'score' not in st.session_state: st.session_state.score = 0
     if 'total' not in st.session_state: st.session_state.total = 0
-    if 'streak' not in st.session_state: st.session_state.streak = 0 # 連続正解数
+    if 'streak' not in st.session_state: st.session_state.streak = 0
     if 'answered' not in st.session_state: st.session_state.answered = False
     if 'result_data' not in st.session_state: st.session_state.result_data = None
     if 'history' not in st.session_state: st.session_state.history = []
@@ -221,17 +233,14 @@ def main():
     with st.sidebar:
         st.header("📊 成績ボード")
         
-        # 1. スコア表示
         st.metric("現在のスコア", f"{st.session_state.score} / {st.session_state.total}")
         
-        # 2. 正答率計算
         if st.session_state.total > 0:
             accuracy = (st.session_state.score / st.session_state.total) * 100
         else:
             accuracy = 0.0
         st.metric("正答率", f"{accuracy:.1f}%")
 
-        # 3. 連続正解数 (連勝)
         st.metric("連続正解", f"{st.session_state.streak} 連勝中🔥")
 
         st.markdown("---")
@@ -254,7 +263,6 @@ def main():
                     st.session_state.current_file_id = file_id
                     st.session_state.queue = [] 
                     st.session_state.history = []
-                    # ファイル変更時に連勝などはリセットしない（継続して学習できるよう）
                     st.success(f"『{selected}』を読み込みました！")
 
         st.markdown("---")
@@ -267,14 +275,15 @@ def main():
     if st.session_state.active_gemini_file:
         # 問題補充
         if not st.session_state.queue and not st.session_state.current:
-            with st.spinner("⚡ 問題を作成中..."):
-                new_q = generate_quiz_batch(st.session_state.use_model, st.session_state.active_gemini_file, mode, st.session_state.history)
+            with st.spinner("⚡ 問題を作成中... (AI思考中)"):
+                new_q = generate_quiz_batch(st.session_state.active_gemini_file, mode, st.session_state.history)
                 if new_q:
                     st.session_state.queue.extend(new_q)
                     for q in new_q: st.session_state.history.append(q['question'])
                     st.rerun()
                 else:
-                    st.error("作成失敗。もう一度試してください。")
+                    # ここでエラーが出ても止まらないように、メッセージを優しくする
+                    st.warning("⚠️ AIが少し疲れているようです。もう一度リロードするか、少し待ってから試してみてください。")
 
         # 次の問題へ
         if not st.session_state.current and st.session_state.queue:
@@ -299,10 +308,10 @@ def main():
                         st.session_state.total += 1
                         if sel == q.get('answer', ''):
                             st.session_state.score += 1
-                            st.session_state.streak += 1 # 連勝+1
+                            st.session_state.streak += 1
                             st.session_state.result_data = {"result": "〇", "feedback": "正解！"}
                         else:
-                            st.session_state.streak = 0 # 連勝ストップ
+                            st.session_state.streak = 0
                             st.session_state.result_data = {"result": "×", "feedback": "不正解"}
                         st.rerun()
             else:
@@ -310,15 +319,15 @@ def main():
                     txt = st.text_area("記述回答", key=f"txt_{st.session_state.input_key}")
                     if st.form_submit_button("採点"):
                         with st.spinner("採点中..."):
-                            res = grade_answer_flexible(st.session_state.use_model, q['question'], q.get('answer', '模範解答なし'), txt)
+                            res = grade_answer_flexible(q['question'], q.get('answer', '模範解答なし'), txt)
                             st.session_state.result_data = res
                             st.session_state.answered = True
                             st.session_state.total += 1
                             if res['result'] == "〇": 
                                 st.session_state.score += 1
-                                st.session_state.streak += 1 # 連勝+1
+                                st.session_state.streak += 1
                             else:
-                                st.session_state.streak = 0 # 連勝ストップ
+                                st.session_state.streak = 0
                             st.rerun()
             
             # --- 結果表示 & お祝い演出 ---
@@ -335,15 +344,12 @@ def main():
                         🎉 おめでとう！ {current_streak} 問連続正解！ 🏆
                         </div>
                         """, unsafe_allow_html=True)
-                        st.balloons() # 風船を飛ばす
+                        st.balloons()
                         st.session_state.balloons_shown = True
                 
-                # 通常の正解風船（1問ごとのプチお祝い）は、連勝表彰がない時だけ飛ばす（うるさくなりすぎないよう）
                 elif res['result'] == "〇" and not st.session_state.balloons_shown:
-                    # st.balloons() # 毎回飛ばしたい場合はコメントアウトを外す
                     st.session_state.balloons_shown = True
 
-                # 結果ボックス表示
                 st.markdown(f'<div class="feedback-box feedback-{cls}">判定: {res["result"]} - {res["feedback"]}</div>', unsafe_allow_html=True)
                 
                 with st.expander("解説"):
@@ -357,8 +363,6 @@ def main():
                     st.rerun()
                 if res['result'] != "〇":
                     if c2.button("やり直す"):
-                        # やり直すときは連勝カウントは戻さない（厳しい仕様）か、戻すか
-                        # ここでは「やり直しても連勝は途切れたまま」にしています
                         st.session_state.answered = False
                         st.session_state.result_data = None
                         st.rerun()
