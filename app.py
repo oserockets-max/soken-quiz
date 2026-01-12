@@ -25,6 +25,7 @@ except:
 # 2. Google Drive APIの認証 (Streamlit Secretsから)
 SCOPES = ['https://www.googleapis.com/auth/drive']
 FOLDER_NAME = "Soken_Quiz_Data" # ドライブ内のフォルダ名
+FOLDER_ID = "1KULNeMIXdpxhvrhcixZgXig6RZMsusxC"
 
 def get_drive_service():
     try:
@@ -217,7 +218,7 @@ def main():
         return
 
     # フォルダ確認
-    folder_id = get_folder_id(drive_service, FOLDER_NAME)
+    folder_id = FOLDER_ID # 1KULNeMIXdpxhvrhcixZgXig6RZMsusxC
     if not folder_id:
         st.error(f"Google Driveに '{FOLDER_NAME}' フォルダが見つかりません。作成してサービスアカウントに共有してください。")
         return
